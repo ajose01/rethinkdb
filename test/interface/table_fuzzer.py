@@ -15,20 +15,21 @@ import driver, scenario_common, utils, vcoptparse
 opts = vcoptparse.OptParser()
 scenario_common.prepare_option_parser_mode_flags(opts)
 opts['random-seed'] = vcoptparse.FloatFlag('--random-seed', random.random())
-opts['num-tables'] = vcoptparse.IntFlag('--num-tables', 6) # Number of tables to create
-opts['table-scale'] = vcoptparse.IntFlag('--table-scale', 7) # Factor of increasing table size
-opts['duration'] = vcoptparse.IntFlag('--duration', 120) # Time to perform fuzzing in seconds
-opts['ignore-timeouts'] = vcoptparse.BoolFlag('--ignore-timeouts') # Ignore table_wait timeouts and continue
-opts['progress'] = vcoptparse.BoolFlag('--progress') # Write messages every 10 seconds with the time remaining
+opts['servers'] = vcoptparse.IntFlag('--servers', 1) # Number of tables to create
+opts['duration'] = vcoptparse.IntFlag('--duration', 900) # Time to perform fuzzing in seconds
+opts['progress'] = vcoptparse.BoolFlag('--progress', False) # Write messages every 10 seconds with the time remaining
+opts['threads'] = vcoptparse.IntFlag('--threads', 16) # Number of client threads to run (not counting changefeeds)
+opts['changefeeds'] = vcoptparse.BoolFlag('--changefeeds', False) # Whether or not to use changefeeds
 parsed_opts = opts.parse(sys.argv)
 _, command_prefix, serve_options = scenario_common.parse_mode_flags(parsed_opts)
 
 r = utils.import_python_driver()
 dbName, tableName = utils.get_test_db_table()
 
-num_threads = 1
+server_names = list(string.ascii_lowercase[:parsed_opts['servers']])
+
+# Global data used by query generators, and a lock to make it thread-safe
 data_lock = threading.Lock()
-server_names = [ 'War' ]
 dbs = set()
 tables = set()
 indexes = set()
@@ -41,7 +42,8 @@ class Db:
     def unlink(self):
         for table in list(self.tables):
             table.unlink()
-        dbs.remove(self)
+        if self in dbs:
+            dbs.remove(self)
 
 class Table:
     def __init__(self, db, name):
@@ -55,8 +57,10 @@ class Table:
     def unlink(self):
         for index in list(self.indexes):
             index.unlink()
-        self.db.tables.remove(self)
-        tables.remove(self)
+        if self in self.db.tables:
+            self.db.tables.remove(self)
+        if self in tables:
+            tables.remove(self)
 
 class Index:
     def __init__(self, table, name):
@@ -65,8 +69,10 @@ class Index:
         table.indexes.add(self)
         indexes.add(self)
     def unlink(self):
-        self.table.indexes.remove(self)
-        indexes.remove(self)
+        if self in self.table.indexes:
+            self.table.indexes.remove(self)
+        if self in indexes:
+            indexes.remove(self)
 
 def make_name():
     return ''.join(random.choice(string.ascii_lowercase) for i in xrange(4))
@@ -103,7 +109,6 @@ def run_random_query(conn, weighted_ops):
         finally:
             data_lock.release()
 
-        print('Running op of type: %s' % str(op_type))
         op.run_query(conn)
 
         data_lock.acquire()
@@ -111,6 +116,8 @@ def run_random_query(conn, weighted_ops):
             op.post_run()
         finally:
             data_lock.release()
+    except r.ReqlAvailabilityError as ex:
+        pass # These are perfectly normal during fuzzing due to concurrent queries
     except r.ReqlRuntimeError as ex:
         print('Exception: %s' % repr(ex))
 
@@ -232,14 +239,6 @@ class index_drop(IndexQuery):
     def post_run(self):
         self.index.unlink()
 
-#class index_rename(IndexQuery):
-#    def __init__(self):
-#        IndexQuery.__init__(self)
-#        self.old_name = self.index.name
-#        self.index.name = make_name()
-#    def sub_query(self, q, conn):
-#        q.index_rename(self.old_name, self.index.name).run(conn)
-
 class changefeed(IndexQuery):
     def thread_fn(self, host, port):
         try:
@@ -270,13 +269,15 @@ def do_fuzz(cluster, stop_event, random_seed):
                     (table_create, 4),
                     (table_drop, 3),
                     (index_create, 8),
-                    (index_drop, 2), #(index_rename, 4),
+                    (index_drop, 2),
                     (insert, 100),
                     (rebalance, 10),
                     (reconfigure, 10),
                     (config_update, 10),
-                    (changefeed, 10),
                     (wait, 10)]
+
+    if parsed_opts['changefeeds']:
+        weighted_ops.append((changefeed, 10))
 
     try:
         server = random.choice(list(cluster.processes))
@@ -284,7 +285,7 @@ def do_fuzz(cluster, stop_event, random_seed):
 
         while not stop_event.is_set():
             run_random_query(conn, weighted_ops)
-        
+
     finally:
         stop_event.set()
 
@@ -295,11 +296,11 @@ with driver.Cluster(initial_servers=server_names, output_folder='.', command_pre
     random.seed(parsed_opts['random-seed'])
 
     print("Server driver ports: %s" % (str([x.driver_port for x in cluster])))
-    print("Fuzzing shards for %ds, random seed: %s (%.2fs)" %
+    print("Fuzzing for %ds, random seed: %s (%.2fs)" %
           (parsed_opts['duration'], repr(parsed_opts['random-seed']), time.time() - startTime))
     stop_event = threading.Event()
     fuzz_threads = []
-    for i in xrange(num_threads):
+    for i in xrange(parsed_opts['threads']):
         fuzz_threads.append(threading.Thread(target=do_fuzz, args=(cluster, stop_event, random.random())))
         fuzz_threads[-1].start()
 
@@ -315,7 +316,8 @@ with driver.Cluster(initial_servers=server_names, output_folder='.', command_pre
         if not all([x.is_alive() for x in fuzz_threads]):
             stop_event.set()
 
-    print("Stopping fuzzing (%d of %d threads remain) (%.2fs)" % (len(fuzz_threads), num_threads, time.time() - startTime))
+    print("Stopping fuzzing (%d of %d threads remain) (%.2fs)" %
+          (len(fuzz_threads), parsed_opts['threads'], time.time() - startTime))
     stop_event.set()
     for thread in fuzz_threads:
         thread.join()
